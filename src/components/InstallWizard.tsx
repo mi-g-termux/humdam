@@ -1498,7 +1498,6 @@ export default function InstallWizard() {
               <p className="text-[11px] text-amber-600 font-medium -mt-2">⚠️ Run the SQL above before entering credentials — otherwise the install will fail.</p>
             )}
             <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-3">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Project URL <span className="text-rose-500">*</span></label>
                 <input type="text" className={inputClass} placeholder="https://xxx.supabase.co" value={supabaseCreds.projectUrl} onChange={handleSbCredChange('projectUrl')} />
@@ -1602,7 +1601,6 @@ export default function InstallWizard() {
             {!rulesConfirmed && (
               <p className="text-[11px] text-amber-600 font-medium">⚠️ Publish both rules above before continuing — otherwise the install will fail with permission errors.</p>
             )}
-            <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-3">
               {/* API Key */}
               <div>
