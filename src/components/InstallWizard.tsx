@@ -862,6 +862,226 @@ function Step6Install({
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
+
+// ── InstallWizard static content constants ──────────────────────────────────
+// Extracted from JSX to prevent esbuild's JSX parser from misreading
+// multi-line template literals spanning hundreds of lines inside <pre> tags.
+const SUPABASE_SETUP_SQL = `-- ══════════════════════════════════════════════════
+--  PART 1 — Core Tables
+-- ══════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS settings   (key TEXT PRIMARY KEY, value JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS products   (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS orders     (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS coupons    (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS categories (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS newsletter (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS reviews    (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS users      (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS product_images         (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS product_variant_groups (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS product_variants       (id TEXT PRIMARY KEY, data JSONB NOT NULL);
+
+-- ══════════════════════════════════════════════════
+--  PART 2 — Payment Security Tables
+--  payment_logs        : server-side audit log (read/write blocked from browser)
+--  processed_payments  : dedup store — prevents double-charging
+-- ══════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS payment_logs (
+  id          TEXT PRIMARY KEY,
+  gateway     TEXT NOT NULL,
+  order_id    TEXT,
+  event       TEXT NOT NULL,
+  amount      NUMERIC,
+  currency    TEXT,
+  status      TEXT,
+  raw         JSONB,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS processed_payments (
+  payment_id   TEXT PRIMARY KEY,
+  gateway      TEXT NOT NULL,
+  order_id     TEXT,
+  amount       NUMERIC,
+  processed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ══════════════════════════════════════════════════
+--  PART 3 — Grants & Row Level Security
+-- ══════════════════════════════════════════════════
+GRANT SELECT,INSERT,UPDATE,DELETE
+  ON settings,products,orders,coupons,categories,newsletter,reviews,users,
+     product_images,product_variant_groups,product_variants
+  TO anon;
+GRANT ALL
+  ON settings,products,orders,coupons,categories,newsletter,reviews,users,
+     product_images,product_variant_groups,product_variants,
+     payment_logs,processed_payments
+  TO service_role;
+
+ALTER PUBLICATION supabase_realtime ADD TABLE settings;
+ALTER PUBLICATION supabase_realtime ADD TABLE orders;
+ALTER PUBLICATION supabase_realtime ADD TABLE products;
+ALTER PUBLICATION supabase_realtime ADD TABLE categories;
+ALTER PUBLICATION supabase_realtime ADD TABLE coupons;
+ALTER PUBLICATION supabase_realtime ADD TABLE reviews;
+ALTER PUBLICATION supabase_realtime ADD TABLE newsletter;
+ALTER PUBLICATION supabase_realtime ADD TABLE product_images;
+ALTER PUBLICATION supabase_realtime ADD TABLE product_variant_groups;
+ALTER PUBLICATION supabase_realtime ADD TABLE product_variants;
+
+ALTER TABLE settings   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE products   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE coupons    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE newsletter ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reviews    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE product_images         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE product_variant_groups ENABLE ROW LEVEL SECURITY;
+ALTER TABLE product_variants       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payment_logs           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE processed_payments     ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "anon all" ON settings   FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON products   FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON coupons    FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON categories FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON newsletter FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON reviews    FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON users      FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON product_images         FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON product_variant_groups FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON product_variants       FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "anon all" ON orders     FOR ALL TO anon USING (true) WITH CHECK (true);
+-- payment_logs & processed_payments: NO anon access (server uses service_role)
+
+-- ══════════════════════════════════════════════════
+--  PART 4 — Atomic stock deduction (prevents oversell)
+-- ══════════════════════════════════════════════════
+CREATE OR REPLACE FUNCTION deduct_stock(p_id TEXT, p_qty INT)
+RETURNS JSONB LANGUAGE plpgsql AS $$
+DECLARE v_product JSONB; v_stock INT;
+BEGIN
+  SELECT data INTO v_product FROM products WHERE id = p_id FOR UPDATE;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  v_stock := (v_product->>'stock')::INT;
+  IF v_stock < p_qty THEN RETURN NULL; END IF;
+  v_product := jsonb_set(v_product, '{stock}', to_jsonb(v_stock - p_qty));
+  UPDATE products SET data = v_product WHERE id = p_id;
+  RETURN v_product;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION deduct_stock(TEXT,INT) TO anon;
+GRANT EXECUTE ON FUNCTION deduct_stock(TEXT,INT) TO service_role;`;
+
+const FIREBASE_FIRESTORE_RULES = `rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn()  { return request.auth != null; }
+    function isAdmin()     { return isSignedIn(); }
+    function notYetInstalled() {
+      return !exists(/databases/$(database)/documents/settings/install_status)
+          || get(/databases/$(database)/documents/settings/install_status).data.installed != true;
+    }
+    function isValidEmail(s) {
+      return s is string && s.size() <= 254 && s.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$');
+    }
+    function isValidPhoneKey(s) {
+      return s is string && s.size() >= 8 && s.size() <= 20 && s.matches('^\\+?[0-9]{8,20}$');
+    }
+
+    match /settings/install_status {
+      allow read, create: if true;
+      allow update, delete: if isAdmin() || (resource.data.installed == false);
+    }
+    match /settings/{docId} {
+      allow read: if true;
+      allow write: if notYetInstalled() || isAdmin();
+    }
+    match /products/{id} {
+      allow read: if true;
+      allow write: if notYetInstalled() || isAdmin();
+      match /images/{imageId}        { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+      match /variantGroups/{groupId} { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+      match /variants/{variantId}    { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+    }
+    match /product_images/{id}         { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+    match /product_variant_groups/{id} { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+    match /product_variants/{id}       { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+    match /categories/{id} { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+    match /coupons/{id}    { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
+    match /reviews/{id} {
+      allow read: if true;
+      allow create: if notYetInstalled()
+                    || (request.resource.data.rating is int
+                        && request.resource.data.rating >= 1
+                        && request.resource.data.rating <= 5
+                        && request.resource.data.comment is string
+                        && request.resource.data.comment.size() > 0
+                        && request.resource.data.comment.size() <= 2000
+                        && request.resource.data.customerName is string
+                        && request.resource.data.customerName.size() > 0
+                        && request.resource.data.customerName.size() <= 100);
+      allow update, delete: if isAdmin();
+    }
+    match /orders/{id} {
+      allow get: if true;
+      allow list: if isAdmin() || (request.query.limit != null && request.query.limit <= 10);
+      allow create: if request.resource.data.customerName is string
+                    && request.resource.data.customerName.size() > 0
+                    && request.resource.data.customerName.size() <= 100
+                    && request.resource.data.total is number
+                    && request.resource.data.total >= 0
+                    && request.resource.data.total <= 1000000
+                    && request.resource.data.items is list
+                    && request.resource.data.items.size() > 0
+                    && request.resource.data.items.size() <= 200
+                    && (!('email' in request.resource.data) || isValidEmail(request.resource.data.email))
+                    && (!('status' in request.resource.data) || request.resource.data.status == 'pending');
+      allow update, delete: if isAdmin();
+    }
+    match /newsletter/{id} {
+      allow create: if isValidEmail(request.resource.data.email)
+                    && request.resource.data.keys().hasOnly(['email','createdAt']);
+      allow read, update, delete: if isAdmin();
+    }
+    match /userPhones/{phoneId} {
+      allow read: if false;
+      allow create: if request.resource.data.phoneKey == phoneId
+                    && isValidPhoneKey(phoneId)
+                    && request.resource.data.userId is string
+                    && request.resource.data.email is string
+                    && !exists(/databases/$(database)/documents/userPhones/$(phoneId));
+      allow update, delete: if isAdmin();
+    }
+    match /users/{userId} {
+      allow list, get: if true;
+      allow create: if isAdmin() ||
+        (request.resource.data.id == userId
+          && isValidEmail(request.resource.data.email)
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 100
+          && request.resource.data.passwordHash is string
+          && request.resource.data.passwordHash.size() <= 128);
+      allow update, delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+    }
+    // Payment — server-only (Admin SDK), clients blocked
+    match /payment_logs/{logId}           { allow read, write: if false; }
+    match /processed_payments/{paymentId} { allow read, write: if false; }
+  }
+}`;
+
+const FIREBASE_STORAGE_RULES = `rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /products/{allPaths=**}   { allow read: if true; allow write: if request.auth != null; }
+    match /categories/{allPaths=**} { allow read: if true; allow write: if request.auth != null; }
+    match /site/{allPaths=**}       { allow read: if true; allow write: if request.auth != null; }
+  }
+}`;
 export default function InstallWizard() {
   // ── Wizard navigation ──────────────────────────────────────────────────────
   const [currentStep, setCurrentStep] = useState<number>(1)
@@ -1253,114 +1473,7 @@ export default function InstallWizard() {
               {/* Code block */}
               <div className="px-4 pb-3">
                 <div className="relative">
-                  <pre id="sb-sql-all" className="bg-slate-900 text-emerald-300 text-[10px] font-mono p-3 rounded overflow-x-auto max-h-52 select-all whitespace-pre">{`-- ══════════════════════════════════════════════════
---  PART 1 — Core Tables
--- ══════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS settings   (key TEXT PRIMARY KEY, value JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS products   (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS orders     (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS coupons    (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS categories (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS newsletter (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS reviews    (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS users      (id  TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS product_images         (id TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS product_variant_groups (id TEXT PRIMARY KEY, data JSONB NOT NULL);
-CREATE TABLE IF NOT EXISTS product_variants       (id TEXT PRIMARY KEY, data JSONB NOT NULL);
-
--- ══════════════════════════════════════════════════
---  PART 2 — Payment Security Tables
---  payment_logs        : server-side audit log (read/write blocked from browser)
---  processed_payments  : dedup store — prevents double-charging
--- ══════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS payment_logs (
-  id          TEXT PRIMARY KEY,
-  gateway     TEXT NOT NULL,
-  order_id    TEXT,
-  event       TEXT NOT NULL,
-  amount      NUMERIC,
-  currency    TEXT,
-  status      TEXT,
-  raw         JSONB,
-  created_at  TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS processed_payments (
-  payment_id   TEXT PRIMARY KEY,
-  gateway      TEXT NOT NULL,
-  order_id     TEXT,
-  amount       NUMERIC,
-  processed_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ══════════════════════════════════════════════════
---  PART 3 — Grants & Row Level Security
--- ══════════════════════════════════════════════════
-GRANT SELECT,INSERT,UPDATE,DELETE
-  ON settings,products,orders,coupons,categories,newsletter,reviews,users,
-     product_images,product_variant_groups,product_variants
-  TO anon;
-GRANT ALL
-  ON settings,products,orders,coupons,categories,newsletter,reviews,users,
-     product_images,product_variant_groups,product_variants,
-     payment_logs,processed_payments
-  TO service_role;
-
-ALTER PUBLICATION supabase_realtime ADD TABLE settings;
-ALTER PUBLICATION supabase_realtime ADD TABLE orders;
-ALTER PUBLICATION supabase_realtime ADD TABLE products;
-ALTER PUBLICATION supabase_realtime ADD TABLE categories;
-ALTER PUBLICATION supabase_realtime ADD TABLE coupons;
-ALTER PUBLICATION supabase_realtime ADD TABLE reviews;
-ALTER PUBLICATION supabase_realtime ADD TABLE newsletter;
-ALTER PUBLICATION supabase_realtime ADD TABLE product_images;
-ALTER PUBLICATION supabase_realtime ADD TABLE product_variant_groups;
-ALTER PUBLICATION supabase_realtime ADD TABLE product_variants;
-
-ALTER TABLE settings   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE products   ENABLE ROW LEVEL SECURITY;
-ALTER TABLE orders     ENABLE ROW LEVEL SECURITY;
-ALTER TABLE coupons    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
-ALTER TABLE newsletter ENABLE ROW LEVEL SECURITY;
-ALTER TABLE reviews    ENABLE ROW LEVEL SECURITY;
-ALTER TABLE users      ENABLE ROW LEVEL SECURITY;
-ALTER TABLE product_images         ENABLE ROW LEVEL SECURITY;
-ALTER TABLE product_variant_groups ENABLE ROW LEVEL SECURITY;
-ALTER TABLE product_variants       ENABLE ROW LEVEL SECURITY;
-ALTER TABLE payment_logs           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE processed_payments     ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "anon all" ON settings   FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON products   FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON coupons    FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON categories FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON newsletter FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON reviews    FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON users      FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON product_images         FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON product_variant_groups FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON product_variants       FOR ALL TO anon USING (true) WITH CHECK (true);
-CREATE POLICY "anon all" ON orders     FOR ALL TO anon USING (true) WITH CHECK (true);
--- payment_logs & processed_payments: NO anon access (server uses service_role)
-
--- ══════════════════════════════════════════════════
---  PART 4 — Atomic stock deduction (prevents oversell)
--- ══════════════════════════════════════════════════
-CREATE OR REPLACE FUNCTION deduct_stock(p_id TEXT, p_qty INT)
-RETURNS JSONB LANGUAGE plpgsql AS $$
-DECLARE v_product JSONB; v_stock INT;
-BEGIN
-  SELECT data INTO v_product FROM products WHERE id = p_id FOR UPDATE;
-  IF NOT FOUND THEN RETURN NULL; END IF;
-  v_stock := (v_product->>'stock')::INT;
-  IF v_stock < p_qty THEN RETURN NULL; END IF;
-  v_product := jsonb_set(v_product, '{stock}', to_jsonb(v_stock - p_qty));
-  UPDATE products SET data = v_product WHERE id = p_id;
-  RETURN v_product;
-END;
-$$;
-GRANT EXECUTE ON FUNCTION deduct_stock(TEXT,INT) TO anon;
-GRANT EXECUTE ON FUNCTION deduct_stock(TEXT,INT) TO service_role;`}</pre>
+                  <pre id="sb-sql-all" className="bg-slate-900 text-emerald-300 text-[10px] font-mono p-3 rounded overflow-x-auto max-h-52 select-all whitespace-pre">{SUPABASE_SETUP_SQL}</pre>
                   <button type="button"
                     onClick={() => { const el = document.getElementById('sb-sql-all'); if (el) navigator.clipboard.writeText(el.innerText).then(() => { setSqlCopied(true); setTimeout(() => setSqlCopied(false), 2500); }).catch(() => {}); }}
                     className="absolute top-2 right-2 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all shadow"
@@ -1441,104 +1554,7 @@ GRANT EXECUTE ON FUNCTION deduct_stock(TEXT,INT) TO service_role;`}</pre>
               </div>
               <div className="px-4 pb-3">
                 <div className="relative">
-                  <pre id="fb-fs-rules" className="bg-slate-900 text-amber-300 text-[10px] font-mono p-3 rounded overflow-x-auto max-h-48 select-all whitespace-pre">{`rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
-
-    function isSignedIn()  { return request.auth != null; }
-    function isAdmin()     { return isSignedIn(); }
-    function notYetInstalled() {
-      return !exists(/databases/$(database)/documents/settings/install_status)
-          || get(/databases/$(database)/documents/settings/install_status).data.installed != true;
-    }
-    function isValidEmail(s) {
-      return s is string && s.size() <= 254 && s.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$');
-    }
-    function isValidPhoneKey(s) {
-      return s is string && s.size() >= 8 && s.size() <= 20 && s.matches('^\\+?[0-9]{8,20}$');
-    }
-
-    match /settings/install_status {
-      allow read, create: if true;
-      allow update, delete: if isAdmin() || (resource.data.installed == false);
-    }
-    match /settings/{docId} {
-      allow read: if true;
-      allow write: if notYetInstalled() || isAdmin();
-    }
-    match /products/{id} {
-      allow read: if true;
-      allow write: if notYetInstalled() || isAdmin();
-      match /images/{imageId}        { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-      match /variantGroups/{groupId} { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-      match /variants/{variantId}    { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-    }
-    match /product_images/{id}         { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-    match /product_variant_groups/{id} { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-    match /product_variants/{id}       { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-    match /categories/{id} { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-    match /coupons/{id}    { allow read: if true; allow write: if notYetInstalled() || isAdmin(); }
-    match /reviews/{id} {
-      allow read: if true;
-      allow create: if notYetInstalled()
-                    || (request.resource.data.rating is int
-                        && request.resource.data.rating >= 1
-                        && request.resource.data.rating <= 5
-                        && request.resource.data.comment is string
-                        && request.resource.data.comment.size() > 0
-                        && request.resource.data.comment.size() <= 2000
-                        && request.resource.data.customerName is string
-                        && request.resource.data.customerName.size() > 0
-                        && request.resource.data.customerName.size() <= 100);
-      allow update, delete: if isAdmin();
-    }
-    match /orders/{id} {
-      allow get: if true;
-      allow list: if isAdmin() || (request.query.limit != null && request.query.limit <= 10);
-      allow create: if request.resource.data.customerName is string
-                    && request.resource.data.customerName.size() > 0
-                    && request.resource.data.customerName.size() <= 100
-                    && request.resource.data.total is number
-                    && request.resource.data.total >= 0
-                    && request.resource.data.total <= 1000000
-                    && request.resource.data.items is list
-                    && request.resource.data.items.size() > 0
-                    && request.resource.data.items.size() <= 200
-                    && (!('email' in request.resource.data) || isValidEmail(request.resource.data.email))
-                    && (!('status' in request.resource.data) || request.resource.data.status == 'pending');
-      allow update, delete: if isAdmin();
-    }
-    match /newsletter/{id} {
-      allow create: if isValidEmail(request.resource.data.email)
-                    && request.resource.data.keys().hasOnly(['email','createdAt']);
-      allow read, update, delete: if isAdmin();
-    }
-    match /userPhones/{phoneId} {
-      allow read: if false;
-      allow create: if request.resource.data.phoneKey == phoneId
-                    && isValidPhoneKey(phoneId)
-                    && request.resource.data.userId is string
-                    && request.resource.data.email is string
-                    && !exists(/databases/$(database)/documents/userPhones/$(phoneId));
-      allow update, delete: if isAdmin();
-    }
-    match /users/{userId} {
-      allow list, get: if true;
-      allow create: if isAdmin() ||
-        (request.resource.data.id == userId
-          && isValidEmail(request.resource.data.email)
-          && request.resource.data.name is string
-          && request.resource.data.name.size() > 0
-          && request.resource.data.name.size() <= 100
-          && request.resource.data.passwordHash is string
-          && request.resource.data.passwordHash.size() <= 128);
-      allow update, delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
-    }
-    // Payment — server-only (Admin SDK), clients blocked
-    match /payment_logs/{logId}           { allow read, write: if false; }
-    match /processed_payments/{paymentId} { allow read, write: if false; }
-  }
-}`}</pre>
+                  <pre id="fb-fs-rules" className="bg-slate-900 text-amber-300 text-[10px] font-mono p-3 rounded overflow-x-auto max-h-48 select-all whitespace-pre">{FIREBASE_FIRESTORE_RULES}</pre>
                   <button type="button"
                     onClick={() => { const el = document.getElementById('fb-fs-rules'); if (el) navigator.clipboard.writeText(el.innerText).then(() => { setRulesCopied(true); setTimeout(() => setRulesCopied(false), 2500); }).catch(() => {}); }}
                     className="absolute top-2 right-2 bg-amber-600 hover:bg-amber-700 active:scale-95 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all shadow"
@@ -1562,14 +1578,7 @@ service cloud.firestore {
               </div>
               <div className="px-4 pb-3">
                 <div className="relative">
-                  <pre id="fb-st-rules" className="bg-slate-900 text-orange-300 text-[10px] font-mono p-3 rounded overflow-x-auto max-h-32 select-all whitespace-pre">{`rules_version = '2';
-service firebase.storage {
-  match /b/{bucket}/o {
-    match /products/{allPaths=**}   { allow read: if true; allow write: if request.auth != null; }
-    match /categories/{allPaths=**} { allow read: if true; allow write: if request.auth != null; }
-    match /site/{allPaths=**}       { allow read: if true; allow write: if request.auth != null; }
-  }
-}`}</pre>
+                  <pre id="fb-st-rules" className="bg-slate-900 text-orange-300 text-[10px] font-mono p-3 rounded overflow-x-auto max-h-32 select-all whitespace-pre">{FIREBASE_STORAGE_RULES}</pre>
                   <button type="button"
                     onClick={() => { const el = document.getElementById('fb-st-rules'); if (el) navigator.clipboard.writeText(el.innerText).then(() => { setStorageRulesCopied(true); setTimeout(() => setStorageRulesCopied(false), 2500); }).catch(() => {}); }}
                     className="absolute top-2 right-2 bg-orange-500 hover:bg-orange-600 active:scale-95 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all shadow"
